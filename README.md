@@ -1,6 +1,6 @@
 # Reliable checkout webhooks with a retry queue
 
-The working path starts at `POST /payment-events`: validate a captured or refunded payment, make the storefront risk decision, and publish the resulting merchant notification. Infrai keeps the delivery queue behind a single `INFRAI_API_KEY`, so the route and worker share one small REST interface rather than separate queue infrastructure.
+The flow begins at `POST /payment-events`: check a captured or refunded payment, run the storefront risk call, then push the merchant notification. Infrai exposes one api for the delivery queue behind a single `INFRAI_API_KEY`, so the route and worker talk to one small REST surface instead of standing up separate broker infra.
 
 ```bash
 npm install
@@ -8,11 +8,11 @@ npm test
 npm run demo
 ```
 
-The demo feeds in a captured USD 129.00 checkout with `riskScore: 82`. Its expected result is `notificationType: "payment.review_required"` and `fulfillmentAction: "hold"`. The focused test checks the same business boundary with `npm test`.
+The demo submits a captured USD 129.00 checkout with `riskScore: 82`. We expect `notificationType: "payment.review_required"` and `fulfillmentAction: "hold"`. The narrower test hits the same business edge with `npm test`.
 
 ## Run the route and worker
 
-Set the two runtime values, then start the payment route:
+Export the two runtime vars, then boot the payment route:
 
 ```bash
 export INFRAI_API_KEY="your-key"
@@ -20,7 +20,7 @@ export MERCHANT_WEBHOOK_URL="https://merchant.example/webhooks/payments"
 npm run dev
 ```
 
-Send a payment event from another terminal:
+From another shell, fire a payment event:
 
 ```bash
 curl -X POST http://localhost:3000/payment-events \
@@ -28,31 +28,31 @@ curl -X POST http://localhost:3000/payment-events \
   -d '{"eventId":"evt_checkout_1042","paymentId":"pay_1042","orderId":"order_1042","amountMinor":12900,"currency":"USD","status":"captured","riskScore":18,"occurredAt":"2026-09-08T10:30:00.000Z"}'
 ```
 
-The route returns a concrete decision and queues its audit record:
+The route replies with a decision and enqueues its audit row:
 
 ```json
 {"eventId":"evt_checkout_1042","notificationType":"payment.captured","fulfillmentAction":"release","queued":true}
 ```
 
-Run `npm run worker` to consume a batch, POST each notification to the merchant endpoint, and acknowledge confirmed deliveries. An unconfirmed merchant response is left pending for another delivery attempt. Both the queue publish and acknowledgement carry stable idempotency keys.
+Run `npm run worker` to pull a batch, POST each note to the merchant endpoint, and ack confirmed deliveries. An unconfirmed merchant response stays pending for another attempt. Both the queue publish and ack carry stable idempotency keys, the same discipline we use for OTP retries.
 
 ## The checkout decision
 
-`src/payment_policy.ts` is deliberately boring business code. Refunds reverse fulfillment. Captures scoring 70 or higher hold the order and emit `payment.review_required`; other captures release it. Each queued payload retains the event, order, payment, timestamp, chosen action, and decision reason for an audit trail.
+`src/payment_policy.ts` is plain business logic on purpose. Refunds undo fulfillment. Captures scoring 70+ hold the order and emit `payment.review_required`; everything else releases it. Every queued payload keeps the event, order, payment, timestamp, chosen action, and reason for audit.
 
-The one real gotcha is acknowledgement timing: acknowledging before the merchant endpoint confirms receipt can lose a notification. This worker acknowledges only after a successful response, while the visibility window gives one batch enough time to finish its HTTP calls.
+The real edge case is ack timing: acknowledge before the merchant endpoint confirms and you can drop a notification. This worker only acks after a 2xx, and the visibility window leaves one batch enough time to finish its HTTP calls.
 
 ## Decision record
 
-**Decision:** use an Infrai queue between the checkout route and merchant delivery, with a short worker that consumes, delivers, and acknowledges.
+**Decision:** put an Infrai queue between the checkout route and merchant delivery, with a small worker that consumes, delivers, and acks.
 
-**Direct delivery from the checkout route** has fewer moving parts, but merchant latency would sit on the buyer's payment request and a transient rejection would need retry state inside the storefront.
+**Direct delivery from the checkout route** has fewer parts, but merchant latency would block the buyer's payment request and a transient reject means retry state inside the storefront.
 
-**A database outbox and polling process** gives strong transactional control. It also adds schema, cleanup, claiming, and polling behavior that this compact service would have to own.
+**A database outbox and polling process** gives tight transactional control. It also drags in schema, cleanup, claiming, and polling the compact service would have to maintain.
 
-**A dedicated webhook platform or a cloud queue** can cover the same boundary. For this example, the plain REST queue is the useful trade: no SDK to install, explicit envelope handling, and little provider-specific code. The application still owns its risk policy and the merchant-facing delivery contract.
+**A dedicated webhook platform or a cloud queue** covers the same seam. For this example, the plain REST queue is the right trade: no SDK to install, explicit envelope handling, little provider-specific code. Your app keeps its risk policy and the merchant-facing delivery contract.
 
-The sample stops at one worker invocation. A process supervisor or scheduler should invoke it continuously for a deployed storefront, and merchant request signing belongs in the receiving contract chosen by both parties.
+The sample stops at one worker invocation. In production a supervisor or cron should call it on a loop, and merchant request signing goes in the receiving contract both sides agree on.
 
 ## License
 
@@ -60,7 +60,7 @@ MIT
 
 ## Before this ships: Checkout Webhook Retry Queue
 
-Quick start is above. For a real deployment you'll also need: The details below apply to Checkout Webhook Retry Queue.
+Quick start is above. For a real deployment you'll also need: the details below apply to Checkout Webhook Retry Queue.
 
 **Account & key**
 
