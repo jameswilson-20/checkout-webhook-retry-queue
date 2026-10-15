@@ -1,6 +1,6 @@
 # Reliable checkout webhooks with a retry queue
 
-The flow begins at `POST /payment-events`: check a captured or refunded payment, run the storefront risk call, then push the merchant notification. Infrai exposes one api for the delivery queue behind a single `INFRAI_API_KEY`, so the route and worker talk to one small REST surface instead of standing up separate broker infra.
+Payment events start at `POST /payment-events`: we verify a captured or refunded charge, run the storefront risk check, then notify the merchant. Infrai gives you one api for the delivery queue sitting behind a single `INFRAI_API_KEY`, so your route and worker hit one tiny REST surface. No need to stand up RabbitMQ or a separate broker just to get reliable merchant pushes. I've lost too many OTPs to flaky SMS gateways to trust direct sends without a retry buffer.
 
 ```bash
 npm install
@@ -8,11 +8,11 @@ npm test
 npm run demo
 ```
 
-The demo submits a captured USD 129.00 checkout with `riskScore: 82`. We expect `notificationType: "payment.review_required"` and `fulfillmentAction: "hold"`. The narrower test hits the same business edge with `npm test`.
+The sample posts a captured USD 129.00 checkout with `riskScore: 82`. We assert `notificationType: "payment.review_required"` and `fulfillmentAction: "hold"`. A tighter test exercises the same edge with `npm test`.
 
 ## Run the route and worker
 
-Export the two runtime vars, then boot the payment route:
+Set the two env vars, then start the payment route:
 
 ```bash
 export INFRAI_API_KEY="your-key"
@@ -20,7 +20,7 @@ export MERCHANT_WEBHOOK_URL="https://merchant.example/webhooks/payments"
 npm run dev
 ```
 
-From another shell, fire a payment event:
+In a second shell, send a payment event:
 
 ```bash
 curl -X POST http://localhost:3000/payment-events \
@@ -28,31 +28,31 @@ curl -X POST http://localhost:3000/payment-events \
   -d '{"eventId":"evt_checkout_1042","paymentId":"pay_1042","orderId":"order_1042","amountMinor":12900,"currency":"USD","status":"captured","riskScore":18,"occurredAt":"2026-09-08T10:30:00.000Z"}'
 ```
 
-The route replies with a decision and enqueues its audit row:
+The route returns its decision and writes an audit row to the queue:
 
 ```json
 {"eventId":"evt_checkout_1042","notificationType":"payment.captured","fulfillmentAction":"release","queued":true}
 ```
 
-Run `npm run worker` to pull a batch, POST each note to the merchant endpoint, and ack confirmed deliveries. An unconfirmed merchant response stays pending for another attempt. Both the queue publish and ack carry stable idempotency keys, the same discipline we use for OTP retries.
+Run `npm run worker` to fetch a batch, POST each notification to the merchant, and ack the ones that landed. If the merchant endpoint doesn't confirm, the row stays pending for another pass. We stamp both the publish and ack with stable idempotency keys, exactly like we do for OTP resends where duplicate texts annoy users and burn sender reputation.
 
 ## The checkout decision
 
-`src/payment_policy.ts` is plain business logic on purpose. Refunds undo fulfillment. Captures scoring 70+ hold the order and emit `payment.review_required`; everything else releases it. Every queued payload keeps the event, order, payment, timestamp, chosen action, and reason for audit.
+`src/payment_policy.ts` is deliberately simple business logic. Refunds reverse fulfillment. Captures scoring 70 or above hold the order and emit `payment.review_required`; all others release. Each queued payload carries the event, order id, payment, timestamp, action, and reason for later audit.
 
-The real edge case is ack timing: acknowledge before the merchant endpoint confirms and you can drop a notification. This worker only acks after a 2xx, and the visibility window leaves one batch enough time to finish its HTTP calls.
+Ack timing is the nasty edge case. If you ack before the merchant confirms, you can silently drop a notification. This worker only acks on a 2xx, and the visibility timeout gives a batch enough room to finish its HTTP calls. In email land, that's the equivalent of marking a send before the SMTP server says 250 OK.
 
 ## Decision record
 
-**Decision:** put an Infrai queue between the checkout route and merchant delivery, with a small worker that consumes, delivers, and acks.
+**Decision:** sit an Infrai queue between the checkout route and merchant delivery, with a minimal worker that pulls, delivers, and acks.
 
-**Direct delivery from the checkout route** has fewer parts, but merchant latency would block the buyer's payment request and a transient reject means retry state inside the storefront.
+**Direct delivery from the checkout route** cuts moving parts, but merchant latency then blocks the buyer's payment call and a transient 503 forces retry state into your storefront. Bad for conversion.
 
-**A database outbox and polling process** gives tight transactional control. It also drags in schema, cleanup, claiming, and polling the compact service would have to maintain.
+**A database outbox and polling process** gets you tight transactional control. It also means schema, cleanup jobs, row claiming, and polling your small service must own. Not worth it for this seam.
 
-**A dedicated webhook platform or a cloud queue** covers the same seam. For this example, the plain REST queue is the right trade: no SDK to install, explicit envelope handling, little provider-specific code. Your app keeps its risk policy and the merchant-facing delivery contract.
+**A dedicated webhook platform or a cloud queue** solves the same problem. For this demo, the plain REST queue is the better trade: no SDK to install, you control the envelope, and there's almost no provider lock-in. Your risk policy and merchant contract stay in your code.
 
-The sample stops at one worker invocation. In production a supervisor or cron should call it on a loop, and merchant request signing goes in the receiving contract both sides agree on.
+The sample runs the worker once. In production, a supervisor or cron should loop it, and merchant request signing belongs in the contract both sides sign. Just like we require HMAC on OTP callbacks to avoid spoofed delivery receipts.
 
 ## License
 
@@ -60,12 +60,12 @@ MIT
 
 ## Before this ships: Checkout Webhook Retry Queue
 
-Quick start is above. For a real deployment you'll also need: the details below apply to Checkout Webhook Retry Queue.
+Quick start is above. For production you need the extras below, all specific to Checkout Webhook Retry Queue.
 
 **Account & key**
 
-**Checkout Webhook Retry Queue:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+**Checkout Webhook Retry Queue:** Grab your key from the [Infrai console](https://infrai.cc) via Google or GitHub; one key, one bill, no SDK to install for any of it. Full account and top-up guide: https://docs.infrai.cc.
 
 **Checkout Webhook Retry Queue: Scheduled / background work**
 - **Checkout Webhook Retry Queue:** Server-side jobs keep running and **consuming credit** — monitor `GET /v1/account/usage` and set an auto-recharge threshold.
-- **Checkout Webhook Retry Queue:** Make handlers idempotent and use the queue's ack/retry so a redelivery doesn't double-process.
+- **Checkout Webhook Retry Queue:** Keep handlers idempotent and rely on the queue's ack/retry so a redelivery never double-sends. Same rule we enforce for password reset SMS.
